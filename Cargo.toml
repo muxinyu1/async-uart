@@ -17,11 +17,14 @@ spin = { version = "0.9", features = ["use_ticket_mutex"] }
 nb = "1.0.0"
 
 executor = { git = "https://github.com/rcore-os/executor" }
+
 lrv-pac = { git = "https://github.com/muxinyu1/lrv-pac", optional = true }
-qemu-pac = {git = "https://github.com/muxinyu1/qemu-pac", optional = true}
+qemu-pac = { git = "https://github.com/muxinyu1/qemu-pac", optional = true }
+jh71xx-pac = { version = "0.6.0", optional = true, features = ["all"]}
 
 [features]
-default = ["board_qemu"]
+default = ["board_vf2"]
 board_qemu = ["uart8250", "qemu-pac"]
 board_lrv = ["uart_xilinx", "lrv-pac"]
+board_vf2 = ["uart8250", "jh71xx-pac"]
 trace = []

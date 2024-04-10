@@ -1,7 +1,6 @@
 use crate::future::GetWakerFuture;
 use crate::trace::{
-    push_trace, ASYNC_READ_POLL, ASYNC_WRITE_POLL, ASYNC_WRITE_WAKE, SERIAL_CTS, SERIAL_INTR_ENTER,
-    SERIAL_INTR_EXIT, SERIAL_RTS, SERIAL_RX, SERIAL_TX,
+    push_trace, ASYNC_READ_POLL, ASYNC_WRITE_POLL, ASYNC_WRITE_WAKE, SERIAL_CTS, SERIAL_RTS, SERIAL_RX, SERIAL_TX,
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -17,6 +16,8 @@ use heapless::spsc;
 use lrv_pac::uart;
 #[cfg(feature = "board_qemu")]
 use qemu_pac::uart;
+#[cfg(feature = "board_vf2")]
+use jh71xx_pac::uart0 as uart;
 pub use serial_config::*;
 use spin::Mutex;
 use crate::println;
@@ -59,6 +60,27 @@ mod serial_config {
             5 => 1,
             6 => 2,
             7 => 3,
+            _ => 0,
+        }
+    }
+}
+
+
+#[cfg(feature = "board_vf2")]
+mod serial_config {
+    pub use uart8250::{uart::LSR, InterruptType, MmioUart8250}; // TODO: What is vf2's uart type?
+    pub type SerialHardware = MmioUart8250<'static>;
+    pub const FIFO_DEPTH: usize = 16;
+    pub const SERIAL_NUM: usize = 4;
+    pub const RTS_PULSE_WIDTH: usize = 8;
+    pub const SERIAL_BASE_ADDRESS: usize = 0x1000_2000;
+    pub const SERIAL_ADDRESS_STRIDE: usize = 0x1000;
+    pub fn irq_to_serial_id(irq: u16) -> usize {
+        match irq {
+            12 => 0,
+            13 => 1,
+            14 => 2,
+            15 => 3,
             _ => 0,
         }
     }
@@ -113,7 +135,7 @@ impl BufferedSerial {
     fn set_divisor(&self, clock: usize, baud_rate: usize) {
         let block = self.hardware();
         let divisor = clock / (16 * baud_rate);
-        block.lcr.write(|w| w.dlab().set_bit());
+        block.lcr().write(|w| w.dlab().set_bit());
         #[cfg(feature = "board_lrv")]
         {
             block
@@ -132,8 +154,16 @@ impl BufferedSerial {
                 .dlh()
                 .write(|w| unsafe { w.bits(((divisor >> 8) & 0b1111_1111) as u8) });
         }
-
-        block.lcr.write(|w| w.dlab().clear_bit());
+        #[cfg(feature = "board_vf2")]
+        {
+            block
+                .dll()
+                .write(|w| unsafe { w.bits((divisor & 0b1111_1111) as u32) });
+            block
+                .dlh()
+                .write(|w| unsafe { w.bits(((divisor >> 8) & 0b1111_1111) as u32) });
+        } // TODO: Here I just set the type to "u32", but is it right?
+        block.lcr().write(|w| w.dlab().clear_bit());
     }
 
     pub(super) fn enable_rdai(&mut self) {
@@ -160,7 +190,7 @@ impl BufferedSerial {
 
     fn try_recv(&self) -> Option<u8> {
         let block = self.hardware();
-        if block.lsr.read().dr().bit_is_set() {
+        if block.lsr().read().dr().bit_is_set() {
             Some(block.rbr().read().rbr().bits())
         } else {
             None
@@ -174,11 +204,15 @@ impl BufferedSerial {
 
     pub fn hardware_init(&mut self, baud_rate: usize) {
         let block = self.hardware();
-        let _unused = block.msr.read().bits();
-        let _unused = block.lsr.read().bits();
-        block.lcr.reset();
+
+        let _unused = block.msr().read().bits();
+        let _unused = block.lsr().read().bits();
+        
+
+        block.lcr().reset();
         // No modem control
-        block.mcr.reset();
+        block.mcr().reset();
+        
         block.ier().reset();
         block.fcr().reset();
 
@@ -186,8 +220,8 @@ impl BufferedSerial {
         self.set_divisor(100_000_000, baud_rate);
         // Disable DLAB and set word length 8 bits, no parity, 1 stop bit
         block
-            .lcr
-            .modify(|_, w| w.dls().eight().pen().disabled().stop().one());
+        .lcr()
+        .modify(|_, w| w.dls().eight().pen().disabled().stop().one());
         // Enable FIFO
         block.fcr().write(|w| {
             w.fifoe()
@@ -200,7 +234,7 @@ impl BufferedSerial {
                 .two_less_than_full()
         });
         // Enable loopback
-        // block.mcr.modify(|_, w| w.loop_().loop_back());
+        // block.mcr().modify(|_, w| w.loop_().loop_back());
         // Enable line status & modem status interrupt
         block
             .ier()
@@ -215,22 +249,22 @@ impl BufferedSerial {
 
     #[inline]
     pub fn read_rts(&self) -> bool {
-        self.hardware().mcr.read().rts().is_asserted()
+        self.hardware().mcr().read().rts().is_asserted()
     }
 
     #[inline]
     pub fn rts(&self, is_asserted: bool) {
-        self.hardware().mcr.modify(|_, w| w.rts().bit(is_asserted))
+        self.hardware().mcr().modify(|_, w| w.rts().bit(is_asserted))
     }
 
     #[inline]
     pub fn cts(&self) -> bool {
-        self.hardware().msr.read().cts().bit()
+        self.hardware().msr().read().cts().bit()
     }
 
     #[inline]
     pub fn dcts(&self) -> bool {
-        self.hardware().msr.read().dcts().bit()
+        self.hardware().msr().read().dcts().bit()
     }
 
     #[inline]
@@ -259,7 +293,7 @@ impl BufferedSerial {
         }
     }
 
-    #[cfg(any(feature = "board_qemu", feature = "board_lrv"))]
+    #[cfg(any(feature = "board_qemu", feature = "board_lrv", feature = "board_vf2"))]
     pub fn interrupt_handler(&mut self) {
         // println!("[SERIAL] Interrupt!");
 
@@ -300,7 +334,7 @@ impl BufferedSerial {
                 }
                 IID_A::RECEIVER_LINE_STATUS => {
                     let block = self.hardware();
-                    let lsr = block.lsr.read();
+                    let lsr = block.lsr().read();
                     // if lsr.bi().bit_is_set() {
                     if lsr.fifoerr().is_error() {
                         if lsr.bi().bit_is_set() {
@@ -314,7 +348,7 @@ impl BufferedSerial {
                         }
                     }
                     if lsr.oe().bit_is_set() {
-                        block.mcr.modify(|_, w| w.rts().deasserted());
+                        block.mcr().modify(|_, w| w.rts().deasserted());
                         println!("[uart] lsr.OE!");
                     }
                 }
@@ -334,8 +368,8 @@ impl BufferedSerial {
                         let block = self.hardware();
                         println!(
                             "[USER SERIAL] EDSSI, MSR: {:#x}, LSR: {:#x}, IER: {:#x}",
-                            block.msr.read().bits(),
-                            block.lsr.read().bits(),
+                            block.msr().read().bits(),
+                            block.lsr().read().bits(),
                             block.ier().read().bits()
                         );
                     }
@@ -352,7 +386,7 @@ impl BufferedSerial {
 impl Write<u8> for BufferedSerial {
     type Error = Infallible;
 
-    #[cfg(any(feature = "board_qemu", feature = "board_lrv"))]
+    #[cfg(any(feature = "board_qemu", feature = "board_lrv", feature = "board_vf2"))]
     fn try_write(&mut self, word: u8) -> nb::Result<(), Self::Error> {
         if self.tx_buffer.len() < DEFAULT_TX_BUFFER_SIZE {
             self.tx_buffer.push_back(word);
@@ -391,8 +425,8 @@ impl Drop for BufferedSerial {
     fn drop(&mut self) {
         let block = self.hardware();
         block.ier().reset();
-        let _unused = block.msr.read().bits();
-        let _unused = block.lsr.read().bits();
+        let _unused = block.msr().read().bits();
+        let _unused = block.lsr().read().bits();
         self.rts(false);
         // reset Rx & Tx FIFO, disable FIFO
         block
@@ -429,7 +463,7 @@ impl PollingSerial {
     fn set_divisor(&self, clock: usize, baud_rate: usize) {
         let block = self.hardware();
         let divisor = clock / (16 * baud_rate);
-        block.lcr.write(|w| w.dlab().divisor_latch());
+        block.lcr().write(|w| w.dlab().divisor_latch());
         #[cfg(feature = "board_lrv")]
         {
             block
@@ -448,23 +482,32 @@ impl PollingSerial {
                 .dlh()
                 .write(|w| unsafe { w.bits(((divisor >> 8) & 0b1111_1111) as u8) });
         }
+        #[cfg(feature = "board_vf2")]
+        {
+            block
+                .dll()
+                .write(|w| unsafe { w.bits((divisor & 0b1111_1111) as u32) });
+            block
+                .dlh()
+                .write(|w| unsafe { w.bits(((divisor >> 8) & 0b1111_1111) as u32) });
+        }
 
-        block.lcr.write(|w| w.dlab().rx_buffer());
+        block.lcr().write(|w| w.dlab().rx_buffer());
     }
 
     #[inline]
     pub fn rts(&self, is_asserted: bool) {
-        self.hardware().mcr.modify(|_, w| w.rts().bit(is_asserted))
+        self.hardware().mcr().modify(|_, w| w.rts().bit(is_asserted))
     }
 
     #[inline]
     pub fn cts(&self) -> bool {
-        self.hardware().msr.read().cts().bit()
+        self.hardware().msr().read().cts().bit()
     }
 
     #[inline]
     pub fn dcts(&self) -> bool {
-        self.hardware().msr.read().dcts().bit()
+        self.hardware().msr().read().dcts().bit()
     }
 
     #[inline]
@@ -479,7 +522,7 @@ impl PollingSerial {
     #[inline]
     fn try_recv(&self) -> Option<u8> {
         let block = self.hardware();
-        if block.lsr.read().dr().is_ready() {
+        if block.lsr().read().dr().is_ready() {
             let ch = block.rbr().read().rbr().bits();
             push_trace(SERIAL_RX | ch as usize);
             Some(ch)
@@ -497,11 +540,11 @@ impl PollingSerial {
 
     pub fn hardware_init(&mut self, baud_rate: usize) {
         let block = self.hardware();
-        let _unused = block.msr.read().bits();
-        let _unused = block.lsr.read().bits();
-        block.lcr.reset();
+        let _unused = block.msr().read().bits();
+        let _unused = block.lsr().read().bits();
+        block.lcr().reset();
         // No modem control
-        block.mcr.reset();
+        block.mcr().reset();
         block.ier().reset();
         block.fcr().reset();
 
@@ -509,7 +552,7 @@ impl PollingSerial {
         self.set_divisor(100_000_000, baud_rate);
         // Disable DLAB and set word length 8 bits, no parity, 1 stop bit
         block
-            .lcr
+            .lcr()
             .modify(|_, w| w.dls().eight().pen().disabled().stop().one());
         // Enable FIFO
         block.fcr().write(|w| {
@@ -524,8 +567,8 @@ impl PollingSerial {
         });
 
         // Loopback
-        // block.mcr.modify(|_, w| w.loop_().loop_back());
-        // block.mcr.modify(|_, w| w.rts().asserted());
+        // block.mcr().modify(|_, w| w.loop_().loop_back());
+        // block.mcr().modify(|_, w| w.rts().asserted());
         self.rts(true);
         let _unused = self.dcts();
     }
@@ -536,7 +579,7 @@ impl PollingSerial {
     #[inline]
     pub fn error_handler(&self) -> bool {
         let block = self.hardware();
-        let lsr = block.lsr.read();
+        let lsr = block.lsr().read();
         if lsr.fifoerr().is_error() {
             if lsr.bi().bit_is_set() {
                 println!("[uart] lsr.BI!");
@@ -549,7 +592,7 @@ impl PollingSerial {
             }
         }
         if lsr.oe().bit_is_set() {
-            block.mcr.modify(|_, w| w.rts().deasserted());
+            block.mcr().modify(|_, w| w.rts().deasserted());
             println!("[uart] lsr.OE!");
             return true;
         }
@@ -560,7 +603,7 @@ impl PollingSerial {
 impl Write<u8> for PollingSerial {
     type Error = Infallible;
 
-    #[cfg(any(feature = "board_qemu", feature = "board_lrv"))]
+    #[cfg(any(feature = "board_qemu", feature = "board_lrv", feature = "board_vf2"))]
     fn try_write(&mut self, word: u8) -> nb::Result<(), Self::Error> {
         if self.dcts() {
             let cts = self.cts();
@@ -597,7 +640,7 @@ impl Write<u8> for PollingSerial {
 impl Read<u8> for PollingSerial {
     type Error = Infallible;
 
-    #[cfg(any(feature = "board_qemu", feature = "board_lrv"))]
+    #[cfg(any(feature = "board_qemu", feature = "board_lrv", feature = "board_vf2"))]
     fn try_read(&mut self) -> nb::Result<u8, Self::Error> {
         if let Some(ch) = self.try_recv() {
             self.rx_count += 1;
@@ -621,8 +664,8 @@ impl Drop for PollingSerial {
     fn drop(&mut self) {
         let block = self.hardware();
         block.ier().reset();
-        let _unused = block.msr.read().bits();
-        let _unused = block.lsr.read().bits();
+        let _unused = block.msr().read().bits();
+        let _unused = block.lsr().read().bits();
         self.rts(false);
         // reset Rx & Tx FIFO, disable FIFO
         block
@@ -693,7 +736,7 @@ impl AsyncSerial {
     fn set_divisor(&self, clock: usize, baud_rate: usize) {
         let block = self.hardware();
         let divisor = clock / (16 * baud_rate);
-        block.lcr.write(|w| w.dlab().set_bit());
+        block.lcr().write(|w| w.dlab().set_bit());
         #[cfg(feature = "board_lrv")]
         {
             block
@@ -712,8 +755,17 @@ impl AsyncSerial {
                 .dlh()
                 .write(|w| unsafe { w.bits(((divisor >> 8) & 0b1111_1111) as u8) });
         }
+        #[cfg(feature = "board_vf2")]
+        {
+            block
+                .dll()
+                .write(|w| unsafe { w.bits((divisor & 0b1111_1111) as u32) });
+            block
+                .dlh()
+                .write(|w| unsafe { w.bits(((divisor >> 8) & 0b1111_1111) as u32) });
+        }
 
-        block.lcr.write(|w| w.dlab().clear_bit());
+        block.lcr().write(|w| w.dlab().clear_bit());
     }
 
     #[inline]
@@ -744,22 +796,22 @@ impl AsyncSerial {
     #[inline]
     pub fn rts(&self, is_asserted: bool) {
         // println!("[uart] rts: {}", is_asserted);
-        self.hardware().mcr.modify(|_, w| w.rts().bit(is_asserted))
+        self.hardware().mcr().modify(|_, w| w.rts().bit(is_asserted))
     }
 
     #[inline]
     pub fn cts(&self) -> bool {
-        self.hardware().msr.read().cts().bit()
+        self.hardware().msr().read().cts().bit()
     }
 
     #[inline]
     pub fn dcts(&self) -> bool {
-        self.hardware().msr.read().dcts().bit()
+        self.hardware().msr().read().dcts().bit()
     }
 
     fn try_recv(&self) -> Option<u8> {
         let block = self.hardware();
-        if block.lsr.read().dr().bit_is_set() {
+        if block.lsr().read().dr().bit_is_set() {
             let ch = block.rbr().read().rbr().bits();
             push_trace(SERIAL_RX | ch as usize);
             Some(ch)
@@ -794,11 +846,11 @@ impl AsyncSerial {
 
     pub fn hardware_init(&self, baud_rate: usize) {
         let block = self.hardware();
-        let _unused = block.msr.read().bits();
-        let _unused = block.lsr.read().bits();
-        block.lcr.reset();
+        let _unused = block.msr().read().bits();
+        let _unused = block.lsr().read().bits();
+        block.lcr().reset();
         // No modem control
-        block.mcr.reset();
+        block.mcr().reset();
         block.ier().reset();
         block.fcr().reset();
 
@@ -806,7 +858,7 @@ impl AsyncSerial {
         self.set_divisor(100_000_000, baud_rate);
         // Disable DLAB and set word length 8 bits, no parity, 1 stop bit
         block
-            .lcr
+            .lcr()
             .modify(|_, w| w.dls().eight().pen().disabled().stop().one());
         // Enable FIFO
         block.fcr().write(|w| {
@@ -863,7 +915,7 @@ impl AsyncSerial {
         self.tx_fifo_count.store(tx_fifo_count, Relaxed);
     }
 
-    #[cfg(any(feature = "board_qemu", feature = "board_lrv"))]
+    #[cfg(any(feature = "board_qemu", feature = "board_lrv", feature = "board_vf2"))]
     pub fn interrupt_handler(&self) {
         // println!("[SERIAL] Interrupt!");
 
@@ -927,7 +979,7 @@ impl AsyncSerial {
                 }
                 IID_A::RECEIVER_LINE_STATUS => {
                     let block = self.hardware();
-                    let lsr = block.lsr.read();
+                    let lsr = block.lsr().read();
                     // if lsr.bi().bit_is_set() {
                     if lsr.fifoerr().is_error() {
                         if lsr.bi().bit_is_set() {
@@ -941,7 +993,7 @@ impl AsyncSerial {
                         }
                     }
                     if lsr.oe().bit_is_set() {
-                        block.mcr.modify(|_, w| w.rts().deasserted());
+                        block.mcr().modify(|_, w| w.rts().deasserted());
                         println!("[uart] lsr.OE!");
                     }
                 }
@@ -976,8 +1028,8 @@ impl AsyncSerial {
                         let block = self.hardware();
                         println!(
                             "[USER SERIAL] EDSSI, MSR: {:#x}, LSR: {:#x}, IER: {:#x}",
-                            block.msr.read().bits(),
-                            block.lsr.read().bits(),
+                            block.msr().read().bits(),
+                            block.lsr().read().bits(),
                             block.ier().read().bits()
                         );
                     }
@@ -1033,8 +1085,8 @@ impl Drop for AsyncSerial {
     fn drop(&mut self) {
         let block = self.hardware();
         block.ier().reset();
-        let _unused = block.msr.read().bits();
-        let _unused = block.lsr.read().bits();
+        let _unused = block.msr().read().bits();
+        let _unused = block.lsr().read().bits();
         self.rts(false);
         // reset Rx & Tx FIFO, disable FIFO
         block
@@ -1169,7 +1221,7 @@ impl AsyncUnbufferedSerial {
     fn set_divisor(&self, clock: usize, baud_rate: usize) {
         let block = self.hardware();
         let divisor = clock / (16 * baud_rate);
-        block.lcr.write(|w| w.dlab().set_bit());
+        block.lcr().write(|w| w.dlab().set_bit());
         #[cfg(feature = "board_lrv")]
         {
             block
@@ -1188,8 +1240,16 @@ impl AsyncUnbufferedSerial {
                 .dlh()
                 .write(|w| unsafe { w.bits(((divisor >> 8) & 0b1111_1111) as u8) });
         }
-
-        block.lcr.write(|w| w.dlab().clear_bit());
+        #[cfg(feature = "board_vf2")]
+        {
+            block
+                .dll()
+                .write(|w| unsafe { w.bits((divisor & 0b1111_1111) as u32) });
+            block
+                .dlh()
+                .write(|w| unsafe { w.bits(((divisor >> 8) & 0b1111_1111) as u32) });
+        }
+        block.lcr().write(|w| w.dlab().clear_bit());
     }
 
     #[inline]
@@ -1220,26 +1280,26 @@ impl AsyncUnbufferedSerial {
     #[inline]
     pub fn rts(&self, is_asserted: bool) {
         // println!("[uart] rts: {}", is_asserted);
-        self.hardware().mcr.modify(|_, w| w.rts().bit(is_asserted))
+        self.hardware().mcr().modify(|_, w| w.rts().bit(is_asserted))
     }
 
     #[inline]
     pub fn cts(&self) -> bool {
-        self.hardware().msr.read().cts().bit()
+        self.hardware().msr().read().cts().bit()
     }
 
     #[inline]
     pub fn dcts(&self) -> bool {
-        self.hardware().msr.read().dcts().bit()
+        self.hardware().msr().read().dcts().bit()
     }
 
     pub fn hardware_init(&self, baud_rate: usize) {
         let block = self.hardware();
-        let _unused = block.msr.read().bits();
-        let _unused = block.lsr.read().bits();
-        block.lcr.reset();
+        let _unused = block.msr().read().bits();
+        let _unused = block.lsr().read().bits();
+        block.lcr().reset();
         // No modem control
-        block.mcr.reset();
+        block.mcr().reset();
         block.ier().reset();
         block.fcr().reset();
 
@@ -1247,7 +1307,7 @@ impl AsyncUnbufferedSerial {
         self.set_divisor(100_000_000, baud_rate);
         // Disable DLAB and set word length 8 bits, no parity, 1 stop bit
         block
-            .lcr
+            .lcr()
             .modify(|_, w| w.dls().eight().pen().disabled().stop().one());
         // Enable FIFO
         block.fcr().write(|w| {
@@ -1289,7 +1349,7 @@ impl AsyncUnbufferedSerial {
         }
     }
 
-    #[cfg(any(feature = "board_qemu", feature = "board_lrv"))]
+    #[cfg(any(feature = "board_qemu", feature = "board_lrv", feature = "board_vf2"))]
     pub fn interrupt_handler(&self) {
         // println!("[SERIAL] Interrupt!");
 
@@ -1325,7 +1385,7 @@ impl AsyncUnbufferedSerial {
                 }
                 IID_A::RECEIVER_LINE_STATUS => {
                     let block = self.hardware();
-                    let lsr = block.lsr.read();
+                    let lsr = block.lsr().read();
                     // if lsr.bi().bit_is_set() {
                     if lsr.fifoerr().is_error() {
                         if lsr.bi().bit_is_set() {
@@ -1339,7 +1399,7 @@ impl AsyncUnbufferedSerial {
                         }
                     }
                     if lsr.oe().bit_is_set() {
-                        block.mcr.modify(|_, w| w.rts().deasserted());
+                        block.mcr().modify(|_, w| w.rts().deasserted());
                         println!("[uart] lsr.OE!");
                     }
                 }
@@ -1362,8 +1422,8 @@ impl AsyncUnbufferedSerial {
                         let block = self.hardware();
                         println!(
                             "[USER SERIAL] EDSSI, MSR: {:#x}, LSR: {:#x}, IER: {:#x}",
-                            block.msr.read().bits(),
-                            block.lsr.read().bits(),
+                            block.msr().read().bits(),
+                            block.lsr().read().bits(),
                             block.ier().read().bits()
                         );
                     }
@@ -1421,8 +1481,8 @@ impl Drop for AsyncUnbufferedSerial {
     fn drop(&mut self) {
         let block = self.hardware();
         block.ier().reset();
-        let _unused = block.msr.read().bits();
-        let _unused = block.lsr.read().bits();
+        let _unused = block.msr().read().bits();
+        let _unused = block.lsr().read().bits();
         self.rts(false);
         // reset Rx & Tx FIFO, disable FIFO
         block
@@ -1446,7 +1506,7 @@ impl UnbufferedSerialReceiver {
     #[inline]
     fn try_recv(&self) -> Option<u8> {
         let block = self.hardware();
-        if block.lsr.read().dr().bit_is_set() {
+        if block.lsr().read().dr().bit_is_set() {
             let ch = block.rbr().read().rbr().bits();
             push_trace(SERIAL_RX | ch as usize);
             Some(ch)
@@ -1462,7 +1522,7 @@ impl UnbufferedSerialReceiver {
 
     #[inline]
     pub fn rts(&self, is_asserted: bool) {
-        self.hardware().mcr.modify(|_, w| w.rts().bit(is_asserted))
+        self.hardware().mcr().modify(|_, w| w.rts().bit(is_asserted))
     }
 }
 
@@ -1521,12 +1581,12 @@ impl UnbufferedSerialSender {
 
     #[inline]
     pub fn cts(&self) -> bool {
-        self.hardware().msr.read().cts().bit()
+        self.hardware().msr().read().cts().bit()
     }
 
     #[inline]
     pub fn dcts(&self) -> bool {
-        self.hardware().msr.read().dcts().bit()
+        self.hardware().msr().read().dcts().bit()
     }
 }
 
