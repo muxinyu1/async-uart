@@ -1,6 +1,6 @@
 use crate::future::GetWakerFuture;
 use crate::trace::{
-    push_trace, ASYNC_READ_POLL, ASYNC_WRITE_POLL, ASYNC_WRITE_WAKE, SERIAL_CTS, SERIAL_RTS, SERIAL_RX, SERIAL_TX,
+    push_trace, ASYNC_READ_POLL, ASYNC_WRITE_POLL, ASYNC_WRITE_WAKE, SERIAL_CTS, SERIAL_RTS, SERIAL_RX, SERIAL_TX, SERIAL_INTR_ENTER,  SERIAL_INTR_EXIT
 };
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
